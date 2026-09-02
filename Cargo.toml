@@ -1,0 +1,23 @@
+[package]
+name = "gh-actions-tui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gh-actions-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+futures = "0.3.34"
+octocrab = "0.54"
+open = "5"
+ratatui = "0.30"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
