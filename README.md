@@ -4,6 +4,8 @@ A terminal UI for watching GitHub Actions workflow runs across one or more
 repositories, with auto-refresh, status filtering, and quick access to open
 runs in your browser.
 
+![gh-actions-tui screenshot](doc/tui.png)
+
 ## Features
 
 - Watch multiple repositories at once.
