@@ -1,9 +1,10 @@
 //! Application state: holds the current set of runs, selection, and status.
 
 use crate::cli::RepoSpec;
-use crate::github::{RepoFetchResult, RunInfo};
+use crate::github::{JobInfo, RepoFetchResult, RunInfo};
 use crate::status::RunOutcome;
 use chrono::{DateTime, Utc};
+use ratatui::text::Text;
 use ratatui::widgets::TableState;
 
 /// A row of data displayed in the runs table, or an inline error for a repo
@@ -69,11 +70,12 @@ impl StatusFilter {
     }
 }
 
-/// The two actions available in the per-row action menu.
-pub const MENU_ITEM_COUNT: usize = 2;
+/// The three actions available in the per-row action menu.
+pub const MENU_ITEM_COUNT: usize = 3;
 
 /// Labels for the per-row action menu, in index order.
-pub const MENU_LABELS: [&str; MENU_ITEM_COUNT] = ["Open in browser", "Rerun failed jobs"];
+pub const MENU_LABELS: [&str; MENU_ITEM_COUNT] =
+    ["Open in browser", "Rerun failed jobs", "View logs"];
 
 /// An overlay shown on top of the table: either the per-row action menu, or
 /// a confirmation prompt before rerunning failed jobs. Mutually exclusive
@@ -86,6 +88,95 @@ pub enum Overlay {
         selected: usize,
     },
     ConfirmRerun,
+}
+
+/// The result of activating a menu item: most actions are handled entirely
+/// within `App`, but some (like fetching jobs for the logs view) need
+/// `main.rs` to dispatch an async API call, so the identity of the run is
+/// returned here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuAction {
+    /// No further action needed (handled synchronously, e.g. opened the
+    /// browser, or moved into the rerun confirm prompt).
+    None,
+    /// The user chose "View logs"; `main.rs` should fetch the run's jobs
+    /// for `(owner, repo, run_id)`.
+    ViewLogsRequested { owner: String, repo: String, run_id: u64 },
+}
+
+/// The full-screen view currently shown, replacing the runs table. Distinct
+/// from [`Overlay`], which is a popup shown on top of the table; `Screen`
+/// variants other than `Runs` take over the entire frame.
+#[derive(Default)]
+pub enum Screen {
+    #[default]
+    Runs,
+    Jobs(JobsScreen),
+    Log(LogScreen),
+}
+
+/// State for the "Jobs" screen: lists the jobs (and their steps) for a
+/// single workflow run.
+pub struct JobsScreen {
+    pub owner: String,
+    pub repo: String,
+    pub run_id: u64,
+    pub workflow_name: String,
+    pub run_number: i64,
+    pub jobs: Vec<JobInfo>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl JobsScreen {
+    fn new(owner: String, repo: String, run_id: u64, workflow_name: String, run_number: i64) -> Self {
+        Self {
+            owner,
+            repo,
+            run_id,
+            workflow_name,
+            run_number,
+            jobs: Vec::new(),
+            selected: 0,
+            loading: true,
+            error: None,
+        }
+    }
+}
+
+/// State for the "Log" screen: the raw (ANSI-colored) log text for a single
+/// job, with a scroll position.
+pub struct LogScreen {
+    pub owner: String,
+    pub repo: String,
+    pub job_id: u64,
+    pub job_name: String,
+    pub text: Text<'static>,
+    pub line_count: usize,
+    pub scroll: u16,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// The `Jobs` screen this log was opened from, so `Esc` can return to
+    /// it exactly as it was (without re-fetching).
+    jobs_screen: Box<JobsScreen>,
+}
+
+impl LogScreen {
+    fn new(job_id: u64, job_name: String, jobs_screen: JobsScreen) -> Self {
+        Self {
+            owner: jobs_screen.owner.clone(),
+            repo: jobs_screen.repo.clone(),
+            job_id,
+            job_name,
+            text: Text::default(),
+            line_count: 0,
+            scroll: 0,
+            loading: true,
+            error: None,
+            jobs_screen: Box::new(jobs_screen),
+        }
+    }
 }
 
 /// Overall application state, updated by the event loop and rendered by the
@@ -112,6 +203,7 @@ pub struct App {
     pub status_message: Option<String>,
     pub should_quit: bool,
     pub overlay: Overlay,
+    pub screen: Screen,
 }
 
 impl App {
@@ -128,6 +220,7 @@ impl App {
             status_message: Some("Loading...".to_string()),
             should_quit: false,
             overlay: Overlay::None,
+            screen: Screen::Runs,
         }
     }
 
@@ -282,16 +375,21 @@ impl App {
     }
 
     /// Activates the currently selected menu item.
-    pub fn menu_activate(&mut self) {
+    pub fn menu_activate(&mut self) -> MenuAction {
         let Overlay::Menu { selected } = self.overlay else {
-            return;
+            return MenuAction::None;
         };
         match selected {
             0 => {
                 self.overlay = Overlay::None;
                 self.open_selected();
+                MenuAction::None
             }
-            1 => self.request_rerun_direct(),
+            1 => {
+                self.request_rerun_direct();
+                MenuAction::None
+            }
+            2 => self.request_view_logs(),
             _ => unreachable!("menu selection out of range"),
         }
     }
@@ -338,6 +436,167 @@ impl App {
         match result {
             Ok(()) => self.set_status("Rerun of failed jobs triggered"),
             Err(e) => self.set_status(format!("Failed to trigger rerun: {e}")),
+        }
+    }
+
+    /// Requests the jobs for the selected run, closing the menu and
+    /// transitioning to the `Jobs` screen (shown in a loading state until
+    /// `apply_jobs_result` is called). Returns the `(owner, repo, run_id)`
+    /// needed for `main.rs` to dispatch the async fetch, or `MenuAction::None`
+    /// if there's no valid selected run.
+    fn request_view_logs(&mut self) -> MenuAction {
+        self.overlay = Overlay::None;
+        let Some(run) = self.selected_run() else {
+            self.set_status("No run selected");
+            return MenuAction::None;
+        };
+        let (owner, repo, run_id) = (run.owner.clone(), run.repo.clone(), run.id);
+        self.screen = Screen::Jobs(JobsScreen::new(
+            owner.clone(),
+            repo.clone(),
+            run_id,
+            run.workflow_name.clone(),
+            run.run_number,
+        ));
+        MenuAction::ViewLogsRequested {
+            owner,
+            repo,
+            run_id,
+        }
+    }
+
+    /// Applies the result of a jobs-list fetch to the active `Jobs` screen.
+    /// No-op if the screen has since changed (e.g. the user navigated back).
+    pub fn apply_jobs_result(&mut self, result: Result<Vec<JobInfo>, String>) {
+        if let Screen::Jobs(jobs) = &mut self.screen {
+            jobs.loading = false;
+            match result {
+                Ok(fetched) => {
+                    jobs.jobs = fetched;
+                    jobs.selected = 0;
+                }
+                Err(e) => jobs.error = Some(e),
+            }
+        }
+    }
+
+    /// Moves the jobs-screen selection to the next job, wrapping around.
+    pub fn jobs_select_next(&mut self) {
+        if let Screen::Jobs(jobs) = &mut self.screen {
+            if !jobs.jobs.is_empty() {
+                jobs.selected = (jobs.selected + 1) % jobs.jobs.len();
+            }
+        }
+    }
+
+    /// Moves the jobs-screen selection to the previous job, wrapping around.
+    pub fn jobs_select_prev(&mut self) {
+        if let Screen::Jobs(jobs) = &mut self.screen {
+            if !jobs.jobs.is_empty() {
+                jobs.selected = (jobs.selected + jobs.jobs.len() - 1) % jobs.jobs.len();
+            }
+        }
+    }
+
+    /// Requests the raw log for the currently selected job in the `Jobs`
+    /// screen, transitioning to the `Log` screen (loading state). Returns
+    /// the `(owner, repo, job_id)` needed for `main.rs` to dispatch the
+    /// async fetch, or `None` if there's no valid job selected (in which
+    /// case the screen is left unchanged).
+    pub fn request_view_log(&mut self) -> Option<(String, String, u64)> {
+        let Screen::Jobs(jobs) = &self.screen else {
+            return None;
+        };
+        jobs.jobs.get(jobs.selected)?;
+        // Take ownership of the current `Jobs` screen so it can be stashed
+        // inside the new `Log` screen (and restored by `back_to_jobs`).
+        let Screen::Jobs(jobs) = std::mem::replace(&mut self.screen, Screen::Runs) else {
+            unreachable!("checked above");
+        };
+        let job = jobs.jobs[jobs.selected].clone();
+        let owner = jobs.owner.clone();
+        let repo = jobs.repo.clone();
+        let job_id = job.id;
+        self.screen = Screen::Log(LogScreen::new(job_id, job.name.clone(), jobs));
+        Some((owner, repo, job_id))
+    }
+
+    /// Applies the result of a job-log fetch to the active `Log` screen.
+    /// Converts the raw bytes (including ANSI escape codes) into a styled
+    /// [`Text`] via `ansi-to-tui`, and scrolls to the first line containing
+    /// GitHub's `##[error]` marker, if any. No-op if the screen has since
+    /// changed.
+    pub fn apply_log_result(&mut self, result: Result<Vec<u8>, String>) {
+        use ansi_to_tui::IntoText;
+
+        if let Screen::Log(log) = &mut self.screen {
+            log.loading = false;
+            match result {
+                Ok(bytes) => match bytes.into_text() {
+                    Ok(text) => {
+                        log.line_count = text.lines.len();
+                        log.scroll = text
+                            .lines
+                            .iter()
+                            .position(|line| {
+                                line.spans
+                                    .iter()
+                                    .any(|span| span.content.contains("##[error]"))
+                            })
+                            .map(|i| i as u16)
+                            .unwrap_or(0);
+                        log.text = text;
+                    }
+                    Err(e) => log.error = Some(format!("Failed to parse log: {e}")),
+                },
+                Err(e) => log.error = Some(e),
+            }
+        }
+    }
+
+    /// Scrolls the log view down by `n` lines, clamped to the last line.
+    pub fn log_scroll_down(&mut self, n: u16) {
+        if let Screen::Log(log) = &mut self.screen {
+            let max = log.line_count.saturating_sub(1) as u16;
+            log.scroll = log.scroll.saturating_add(n).min(max);
+        }
+    }
+
+    /// Scrolls the log view up by `n` lines, clamped to the top.
+    pub fn log_scroll_up(&mut self, n: u16) {
+        if let Screen::Log(log) = &mut self.screen {
+            log.scroll = log.scroll.saturating_sub(n);
+        }
+    }
+
+    /// Jumps the log view to the first line.
+    pub fn log_scroll_to_top(&mut self) {
+        if let Screen::Log(log) = &mut self.screen {
+            log.scroll = 0;
+        }
+    }
+
+    /// Jumps the log view to the last line.
+    pub fn log_scroll_to_bottom(&mut self) {
+        if let Screen::Log(log) = &mut self.screen {
+            log.scroll = log.line_count.saturating_sub(1) as u16;
+        }
+    }
+
+    /// Returns from the `Jobs` or `Log` screen back to the runs table.
+    pub fn back_to_runs(&mut self) {
+        self.screen = Screen::Runs;
+    }
+
+    /// Returns from the `Log` screen back to the `Jobs` screen it was
+    /// opened from, exactly as it was (no re-fetch). No-op if not
+    /// currently on the `Log` screen.
+    pub fn back_to_jobs(&mut self) {
+        if let Screen::Log(_) = &self.screen {
+            let Screen::Log(log) = std::mem::replace(&mut self.screen, Screen::Runs) else {
+                unreachable!("checked above");
+            };
+            self.screen = Screen::Jobs(*log.jobs_screen);
         }
     }
 
@@ -397,6 +656,7 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::StepInfo;
 
     /// Builds a minimal `RunInfo` for tests, with only `status`/`conclusion`
     /// varying between cases.
@@ -537,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_navigation_wraps_between_two_items() {
+    fn menu_navigation_wraps_between_three_items() {
         let mut app = App::new(vec![], 10);
         app.apply_results(vec![RepoFetchResult::Ok(vec![run(
             "completed",
@@ -552,10 +812,13 @@ mod tests {
         assert_eq!(app.overlay, Overlay::Menu { selected: 1 });
 
         app.menu_select_next();
+        assert_eq!(app.overlay, Overlay::Menu { selected: 2 });
+
+        app.menu_select_next();
         assert_eq!(app.overlay, Overlay::Menu { selected: 0 });
 
         app.menu_select_prev();
-        assert_eq!(app.overlay, Overlay::Menu { selected: 1 });
+        assert_eq!(app.overlay, Overlay::Menu { selected: 2 });
     }
 
     #[test]
@@ -618,5 +881,199 @@ mod tests {
 
         app.cancel_overlay();
         assert_eq!(app.overlay, Overlay::None);
+    }
+
+    fn job(id: u64, name: &str, conclusion: Option<&str>) -> JobInfo {
+        JobInfo {
+            id,
+            name: name.to_string(),
+            status: "completed".to_string(),
+            conclusion: conclusion.map(str::to_string),
+            steps: vec![StepInfo {
+                number: 1,
+                name: "Run tests".to_string(),
+                status: "completed".to_string(),
+                conclusion: conclusion.map(str::to_string),
+            }],
+        }
+    }
+
+    #[test]
+    fn view_logs_menu_item_requests_jobs_and_switches_screen() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.open_menu();
+        app.menu_select_next(); // -> Rerun failed jobs
+        app.menu_select_next(); // -> View logs
+
+        let action = app.menu_activate();
+        assert_eq!(
+            action,
+            MenuAction::ViewLogsRequested {
+                owner: "owner".to_string(),
+                repo: "repo".to_string(),
+                run_id: 1,
+            }
+        );
+        assert!(matches!(app.screen, Screen::Jobs(_)));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn apply_jobs_result_populates_jobs_screen() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.open_menu();
+        app.menu_select_next();
+        app.menu_select_next();
+        app.menu_activate();
+
+        app.apply_jobs_result(Ok(vec![job(1, "build", Some("failure"))]));
+
+        let Screen::Jobs(jobs) = &app.screen else {
+            panic!("expected Jobs screen");
+        };
+        assert!(!jobs.loading);
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(jobs.jobs[0].name, "build");
+    }
+
+    #[test]
+    fn jobs_select_next_prev_wrap() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.open_menu();
+        app.menu_select_next();
+        app.menu_select_next();
+        app.menu_activate();
+        app.apply_jobs_result(Ok(vec![
+            job(1, "build", Some("failure")),
+            job(2, "test", Some("success")),
+        ]));
+
+        app.jobs_select_next();
+        let Screen::Jobs(jobs) = &app.screen else {
+            panic!("expected Jobs screen");
+        };
+        assert_eq!(jobs.selected, 1);
+
+        app.jobs_select_next();
+        let Screen::Jobs(jobs) = &app.screen else {
+            panic!("expected Jobs screen");
+        };
+        assert_eq!(jobs.selected, 0);
+
+        app.jobs_select_prev();
+        let Screen::Jobs(jobs) = &app.screen else {
+            panic!("expected Jobs screen");
+        };
+        assert_eq!(jobs.selected, 1);
+    }
+
+    #[test]
+    fn request_view_log_switches_to_log_screen_and_back_restores_jobs() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.open_menu();
+        app.menu_select_next();
+        app.menu_select_next();
+        app.menu_activate();
+        app.apply_jobs_result(Ok(vec![job(42, "build", Some("failure"))]));
+
+        let result = app.request_view_log();
+        assert_eq!(
+            result,
+            Some(("owner".to_string(), "repo".to_string(), 42))
+        );
+        assert!(matches!(app.screen, Screen::Log(_)));
+
+        app.back_to_jobs();
+        let Screen::Jobs(jobs) = &app.screen else {
+            panic!("expected Jobs screen");
+        };
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(jobs.jobs[0].id, 42);
+    }
+
+    #[test]
+    fn apply_log_result_scrolls_to_first_error_marker() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.open_menu();
+        app.menu_select_next();
+        app.menu_select_next();
+        app.menu_activate();
+        app.apply_jobs_result(Ok(vec![job(1, "build", Some("failure"))]));
+        app.request_view_log();
+
+        let log_bytes = b"line one\nline two\n##[error]it broke\nline four".to_vec();
+        app.apply_log_result(Ok(log_bytes));
+
+        let Screen::Log(log) = &app.screen else {
+            panic!("expected Log screen");
+        };
+        assert!(!log.loading);
+        assert_eq!(log.scroll, 2);
+        assert_eq!(log.line_count, 4);
+    }
+
+    #[test]
+    fn apply_log_result_defaults_to_top_when_no_error_marker() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("success"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.open_menu();
+        app.menu_select_next();
+        app.menu_select_next();
+        app.menu_activate();
+        app.apply_jobs_result(Ok(vec![job(1, "build", Some("success"))]));
+        app.request_view_log();
+
+        app.apply_log_result(Ok(b"all good\nnothing to see".to_vec()));
+
+        let Screen::Log(log) = &app.screen else {
+            panic!("expected Log screen");
+        };
+        assert_eq!(log.scroll, 0);
+    }
+
+    #[test]
+    fn back_to_runs_resets_screen() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.open_menu();
+        app.menu_select_next();
+        app.menu_select_next();
+        app.menu_activate();
+
+        app.back_to_runs();
+        assert!(matches!(app.screen, Screen::Runs));
     }
 }

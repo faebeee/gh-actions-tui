@@ -74,11 +74,19 @@ async fn run_app(
     let (rerun_tx, rerun_rx) = tokio_mpsc::unbounded_channel();
     bridge.spawn_rerun_bridge(rerun_rx);
 
+    let (jobs_tx, jobs_rx) = tokio_mpsc::unbounded_channel();
+    bridge.spawn_jobs_bridge(jobs_rx);
+
+    let (log_tx, log_rx) = tokio_mpsc::unbounded_channel();
+    bridge.spawn_log_bridge(log_rx);
+
     let ctx = AppContext {
         client: &client,
         cli: &cli,
         fetch_tx: &fetch_tx,
         rerun_tx: &rerun_tx,
+        jobs_tx: &jobs_tx,
+        log_tx: &log_tx,
     };
 
     // Kick off the initial fetch immediately.
@@ -105,6 +113,8 @@ async fn run_app(
             }
             Event::FetchComplete(results) => app.apply_results(results),
             Event::RerunComplete(result) => app.apply_rerun_result(result),
+            Event::JobsFetched(result) => app.apply_jobs_result(result),
+            Event::LogFetched(result) => app.apply_log_result(result),
             Event::Resize => {}
         }
     }
@@ -118,6 +128,8 @@ struct AppContext<'a> {
     cli: &'a Cli,
     fetch_tx: &'a tokio_mpsc::UnboundedSender<Vec<github::RepoFetchResult>>,
     rerun_tx: &'a tokio_mpsc::UnboundedSender<Result<(), String>>,
+    jobs_tx: &'a tokio_mpsc::UnboundedSender<Result<Vec<github::JobInfo>, String>>,
+    log_tx: &'a tokio_mpsc::UnboundedSender<Result<Vec<u8>, String>>,
 }
 
 fn handle_key(key: KeyEvent, app: &mut App, ctx: &AppContext) {
@@ -126,14 +138,55 @@ fn handle_key(key: KeyEvent, app: &mut App, ctx: &AppContext) {
         return;
     }
 
-    use app::Overlay;
+    use app::{MenuAction, Overlay, Screen};
+
+    match &app.screen {
+        Screen::Jobs(_) => {
+            match key.code {
+                KeyCode::Esc => app.back_to_runs(),
+                KeyCode::Down | KeyCode::Char('j') => app.jobs_select_next(),
+                KeyCode::Up | KeyCode::Char('k') => app.jobs_select_prev(),
+                KeyCode::Enter => {
+                    if let Some((owner, repo, job_id)) = app.request_view_log() {
+                        trigger_fetch_log(ctx.client, owner, repo, job_id, ctx.log_tx);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        Screen::Log(_) => {
+            match key.code {
+                KeyCode::Esc => app.back_to_jobs(),
+                KeyCode::Down | KeyCode::Char('j') => app.log_scroll_down(1),
+                KeyCode::Up | KeyCode::Char('k') => app.log_scroll_up(1),
+                KeyCode::PageDown => app.log_scroll_down(20),
+                KeyCode::PageUp => app.log_scroll_up(20),
+                KeyCode::Char('g') => app.log_scroll_to_top(),
+                KeyCode::Char('G') => app.log_scroll_to_bottom(),
+                _ => {}
+            }
+            return;
+        }
+        Screen::Runs => {}
+    }
+
     match app.overlay {
         Overlay::Menu { .. } => {
             match key.code {
                 KeyCode::Esc => app.close_overlay(),
                 KeyCode::Down | KeyCode::Char('j') => app.menu_select_next(),
                 KeyCode::Up | KeyCode::Char('k') => app.menu_select_prev(),
-                KeyCode::Enter => app.menu_activate(),
+                KeyCode::Enter => {
+                    if let MenuAction::ViewLogsRequested {
+                        owner,
+                        repo,
+                        run_id,
+                    } = app.menu_activate()
+                    {
+                        trigger_fetch_jobs(ctx.client, owner, repo, run_id, ctx.jobs_tx);
+                    }
+                }
                 _ => {}
             }
             // If activating the menu moved us into the confirm prompt, fall
@@ -172,6 +225,46 @@ fn handle_key(key: KeyEvent, app: &mut App, ctx: &AppContext) {
         KeyCode::Char('F') => app.cycle_filter_prev(),
         _ => {}
     }
+}
+
+/// Spawns an async task that fetches the jobs (with steps) for a single
+/// workflow run and sends the result back over the jobs channel.
+fn trigger_fetch_jobs(
+    client: &Arc<GitHubClient>,
+    owner: String,
+    repo: String,
+    run_id: u64,
+    jobs_tx: &tokio_mpsc::UnboundedSender<Result<Vec<github::JobInfo>, String>>,
+) {
+    let client = Arc::clone(client);
+    let tx = jobs_tx.clone();
+    tokio::spawn(async move {
+        let result = client
+            .fetch_jobs(&owner, &repo, run_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+    });
+}
+
+/// Spawns an async task that fetches the raw log for a single job and sends
+/// the result back over the log channel.
+fn trigger_fetch_log(
+    client: &Arc<GitHubClient>,
+    owner: String,
+    repo: String,
+    job_id: u64,
+    log_tx: &tokio_mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+) {
+    let client = Arc::clone(client);
+    let tx = log_tx.clone();
+    tokio::spawn(async move {
+        let result = client
+            .fetch_job_log(&owner, &repo, job_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+    });
 }
 
 /// Spawns an async task that triggers a rerun of failed jobs for the given

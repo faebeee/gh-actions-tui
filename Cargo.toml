@@ -8,15 +8,19 @@ name = "gh-actions-tui"
 path = "src/main.rs"
 
 [dependencies]
+ansi-to-tui = "8"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 futures = "0.3.34"
 http = "1"
+http-body-util = "0.1.5"
 octocrab = "0.54"
 open = "5"
 ratatui = "0.30"
+serde = "1.0.229"
+serde_json = "1.0.151"
 tokio = { version = "1", features = ["full"] }
 
 [profile.release]

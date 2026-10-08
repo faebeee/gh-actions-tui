@@ -1,6 +1,6 @@
 //! TUI rendering: draws the runs table, header, and footer/help bar.
 
-use crate::app::{App, Overlay, Row, MENU_LABELS};
+use crate::app::{App, JobsScreen, LogScreen, Overlay, Row, Screen, MENU_LABELS};
 use crate::status::RunOutcome;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,6 +14,14 @@ use ratatui::Frame;
 const COLUMN_COUNT: usize = 7;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    match &app.screen {
+        Screen::Runs => draw_runs_screen(frame, app),
+        Screen::Jobs(_) => draw_jobs_screen(frame, app),
+        Screen::Log(_) => draw_log_screen(frame, app),
+    }
+}
+
+fn draw_runs_screen(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -222,6 +230,150 @@ fn draw_confirm_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let rect = centered_rect(50, 30, area);
     frame.render_widget(Clear, rect);
     frame.render_widget(paragraph, rect);
+}
+
+/// Draws the full-screen "Jobs" view: the list of jobs (and their steps)
+/// for a single workflow run.
+fn draw_jobs_screen(frame: &mut Frame, app: &App) {
+    let Screen::Jobs(jobs) = &app.screen else {
+        return;
+    };
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header
+            Constraint::Min(3),    // jobs list
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let title = format!(
+        "Jobs — {} #{} (run #{}) — {}/{}",
+        jobs.workflow_name, jobs.run_number, jobs.run_id, jobs.owner, jobs.repo
+    );
+    let header = Paragraph::new(title).block(Block::default().borders(Borders::ALL).title("gh-actions-tui"));
+    frame.render_widget(header, chunks[0]);
+
+    draw_jobs_body(frame, jobs, chunks[1]);
+
+    let help = "↑/k up  ↓/j down  Enter view log  Esc back";
+    let text = match &jobs.error {
+        Some(e) => format!("{help}  |  error: {e}"),
+        None if jobs.loading => format!("{help}  |  Loading jobs..."),
+        None => help.to_string(),
+    };
+    frame.render_widget(Paragraph::new(Line::from(text)), chunks[2]);
+}
+
+/// Renders the job list (with nested, dimmed step rows) for the jobs
+/// screen body.
+fn draw_jobs_body(frame: &mut Frame, jobs: &JobsScreen, area: Rect) {
+    if jobs.loading {
+        let p = Paragraph::new("Loading jobs...").block(Block::default().borders(Borders::ALL).title("Jobs"));
+        frame.render_widget(p, area);
+        return;
+    }
+    if jobs.jobs.is_empty() {
+        let message = jobs
+            .error
+            .clone()
+            .unwrap_or_else(|| "No jobs found for this run".to_string());
+        let p = Paragraph::new(message).block(Block::default().borders(Borders::ALL).title("Jobs"));
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let mut items: Vec<ListItem> = Vec::new();
+    // Tracks, for each rendered list item, which job index it belongs to,
+    // so we can highlight all lines (job + its steps) of the selected job.
+    let mut owning_job: Vec<usize> = Vec::new();
+
+    for (job_idx, job) in jobs.jobs.iter().enumerate() {
+        let (label, style) = status_style(&job.status, job.conclusion.as_deref());
+        items.push(ListItem::new(Span::styled(
+            format!("{label} {}", job.name),
+            style,
+        )));
+        owning_job.push(job_idx);
+
+        // Defensively sort by step number in case the API doesn't return
+        // them in order.
+        let mut steps = job.steps.clone();
+        steps.sort_by_key(|step| step.number);
+        for step in &steps {
+            let (step_label, step_style) = status_style(&step.status, step.conclusion.as_deref());
+            items.push(ListItem::new(Span::styled(
+                format!("    {step_label} {}", step.name),
+                step_style.add_modifier(Modifier::DIM),
+            )));
+            owning_job.push(job_idx);
+        }
+    }
+
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Jobs"));
+
+    // Highlight every line that belongs to the selected job.
+    let mut state = ratatui::widgets::ListState::default();
+    if let Some(first_line) = owning_job.iter().position(|&j| j == jobs.selected) {
+        state.select(Some(first_line));
+    }
+    let list = list.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Draws the full-screen "Log" view: the raw (ANSI-colored) log for a
+/// single job.
+fn draw_log_screen(frame: &mut Frame, app: &App) {
+    let Screen::Log(log) = &app.screen else {
+        return;
+    };
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header
+            Constraint::Min(3),    // log body
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let title = format!(
+        "Log — {} (job #{}) — {}/{}",
+        log.job_name, log.job_id, log.owner, log.repo
+    );
+    let header = Paragraph::new(title).block(Block::default().borders(Borders::ALL).title("gh-actions-tui"));
+    frame.render_widget(header, chunks[0]);
+
+    draw_log_body(frame, log, chunks[1]);
+
+    let help = "↑/k ↓/j scroll  PgUp/PgDn page  g/G top/bottom  Esc back";
+    let text = match &log.error {
+        Some(e) => format!("{help}  |  error: {e}"),
+        None if log.loading => format!("{help}  |  Loading log..."),
+        None => format!("{help}  |  line {}/{}", log.scroll + 1, log.line_count),
+    };
+    frame.render_widget(Paragraph::new(Line::from(text)), chunks[2]);
+}
+
+fn draw_log_body(frame: &mut Frame, log: &LogScreen, area: Rect) {
+    if log.loading {
+        let p = Paragraph::new("Loading log...").block(Block::default().borders(Borders::ALL).title("Log"));
+        frame.render_widget(p, area);
+        return;
+    }
+    if let Some(e) = &log.error {
+        let p = Paragraph::new(format!("Failed to load log: {e}"))
+            .block(Block::default().borders(Borders::ALL).title("Log"));
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let paragraph = Paragraph::new(log.text.clone())
+        .block(Block::default().borders(Borders::ALL).title("Log"))
+        .scroll((log.scroll, 0));
+    frame.render_widget(paragraph, area);
 }
 
 /// Maps a run's status/conclusion to a display label and color.

@@ -5,7 +5,7 @@
 //! ticker and the async fetch-result channel. This keeps the render loop
 //! simple: it just awaits the next [`Event`].
 
-use crate::github::RepoFetchResult;
+use crate::github::{JobInfo, RepoFetchResult};
 use crossterm::event::{self as ct_event, Event as CtEvent, KeyEvent, KeyEventKind};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -22,6 +22,10 @@ pub enum Event {
     /// A rerun-failed-jobs API call completed, with `Err` holding a
     /// human-readable message.
     RerunComplete(Result<(), String>),
+    /// A jobs-list fetch for a single run completed.
+    JobsFetched(Result<Vec<JobInfo>, String>),
+    /// A single job's raw log fetch completed.
+    LogFetched(Result<Vec<u8>, String>),
     /// The terminal was resized.
     Resize,
 }
@@ -104,6 +108,35 @@ impl EventBridge {
         tokio::spawn(async move {
             while let Some(result) = rerun_rx.recv().await {
                 if tx.send(Event::RerunComplete(result)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Bridges an async tokio channel (used by the jobs-list fetch task to
+    /// report completion) into the sync channel consumed by the main loop.
+    pub fn spawn_jobs_bridge(
+        &self,
+        mut jobs_rx: tokio_mpsc::UnboundedReceiver<Result<Vec<JobInfo>, String>>,
+    ) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(result) = jobs_rx.recv().await {
+                if tx.send(Event::JobsFetched(result)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Bridges an async tokio channel (used by the job-log fetch task to
+    /// report completion) into the sync channel consumed by the main loop.
+    pub fn spawn_log_bridge(&self, mut log_rx: tokio_mpsc::UnboundedReceiver<Result<Vec<u8>, String>>) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(result) = log_rx.recv().await {
+                if tx.send(Event::LogFetched(result)).is_err() {
                     return;
                 }
             }
