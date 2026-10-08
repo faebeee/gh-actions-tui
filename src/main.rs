@@ -71,10 +71,14 @@ async fn run_app(
     let (fetch_tx, fetch_rx) = tokio_mpsc::unbounded_channel();
     bridge.spawn_fetch_bridge(fetch_rx);
 
+    let (rerun_tx, rerun_rx) = tokio_mpsc::unbounded_channel();
+    bridge.spawn_rerun_bridge(rerun_rx);
+
     let ctx = AppContext {
         client: &client,
         cli: &cli,
         fetch_tx: &fetch_tx,
+        rerun_tx: &rerun_tx,
     };
 
     // Kick off the initial fetch immediately.
@@ -100,6 +104,7 @@ async fn run_app(
                 trigger_fetch(ctx.client, ctx.cli, ctx.fetch_tx);
             }
             Event::FetchComplete(results) => app.apply_results(results),
+            Event::RerunComplete(result) => app.apply_rerun_result(result),
             Event::Resize => {}
         }
     }
@@ -112,6 +117,7 @@ struct AppContext<'a> {
     client: &'a Arc<GitHubClient>,
     cli: &'a Cli,
     fetch_tx: &'a tokio_mpsc::UnboundedSender<Vec<github::RepoFetchResult>>,
+    rerun_tx: &'a tokio_mpsc::UnboundedSender<Result<(), String>>,
 }
 
 fn handle_key(key: KeyEvent, app: &mut App, ctx: &AppContext) {
@@ -120,11 +126,44 @@ fn handle_key(key: KeyEvent, app: &mut App, ctx: &AppContext) {
         return;
     }
 
+    use app::Overlay;
+    match app.overlay {
+        Overlay::Menu { .. } => {
+            match key.code {
+                KeyCode::Esc => app.close_overlay(),
+                KeyCode::Down | KeyCode::Char('j') => app.menu_select_next(),
+                KeyCode::Up | KeyCode::Char('k') => app.menu_select_prev(),
+                KeyCode::Enter => app.menu_activate(),
+                _ => {}
+            }
+            // If activating the menu moved us into the confirm prompt, fall
+            // through so the user doesn't need a second keypress to see it
+            // (no action needed here; it's just rendered next frame).
+            return;
+        }
+        Overlay::ConfirmRerun => {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    if let Some((owner, repo, run_id)) = app.confirm_rerun() {
+                        app.set_status("Triggering rerun of failed jobs...");
+                        trigger_rerun(ctx.client, owner, repo, run_id, ctx.rerun_tx);
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => app.cancel_overlay(),
+                _ => {}
+            }
+            return;
+        }
+        Overlay::None => {}
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.quit(),
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
         KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
-        KeyCode::Enter | KeyCode::Char('o') => app.open_selected(),
+        KeyCode::Char('o') => app.open_selected(),
+        KeyCode::Enter => app.open_menu(),
+        KeyCode::Char('R') => app.request_rerun_direct(),
         KeyCode::Char('r') => {
             app.begin_refresh();
             trigger_fetch(ctx.client, ctx.cli, ctx.fetch_tx);
@@ -133,6 +172,26 @@ fn handle_key(key: KeyEvent, app: &mut App, ctx: &AppContext) {
         KeyCode::Char('F') => app.cycle_filter_prev(),
         _ => {}
     }
+}
+
+/// Spawns an async task that triggers a rerun of failed jobs for the given
+/// run and sends the result back over the rerun channel.
+fn trigger_rerun(
+    client: &Arc<GitHubClient>,
+    owner: String,
+    repo: String,
+    run_id: u64,
+    rerun_tx: &tokio_mpsc::UnboundedSender<Result<(), String>>,
+) {
+    let client = Arc::clone(client);
+    let tx = rerun_tx.clone();
+    tokio::spawn(async move {
+        let result = client
+            .rerun_failed_jobs(&owner, &repo, run_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+    });
 }
 
 /// Spawns an async task that fetches runs for all configured repos and sends

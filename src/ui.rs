@@ -1,11 +1,11 @@
 //! TUI rendering: draws the runs table, header, and footer/help bar.
 
-use crate::app::{App, Row};
+use crate::app::{App, Overlay, Row, MENU_LABELS};
 use crate::status::RunOutcome;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row as TableRow, Table};
 use ratatui::Frame;
 
 /// Number of columns in the runs table (REPO, WORKFLOW, BRANCH, EVENT,
@@ -27,6 +27,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, app, chunks[0]);
     draw_table(frame, app, chunks[1]);
     draw_footer(frame, app, chunks[2]);
+
+    match app.overlay {
+        Overlay::Menu { selected } => draw_menu_overlay(frame, app, area, selected),
+        Overlay::ConfirmRerun => draw_confirm_overlay(frame, app, area),
+        Overlay::None => {}
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -133,7 +139,7 @@ fn error_row(repo: &str, message: &str) -> TableRow<'static> {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let help = "↑/k up  ↓/j down  o/Enter open in browser  r refresh  f/F filter  q quit";
+    let help = "↑/k up  ↓/j down  Enter menu  o open  R rerun failed  r refresh  f/F filter  q quit";
     let text = match &app.status_message {
         Some(msg) if app.refreshing => format!("{help}  |  {msg}"),
         Some(msg) => format!("{help}  |  {msg}"),
@@ -141,6 +147,81 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let paragraph = Paragraph::new(Line::from(text));
     frame.render_widget(paragraph, area);
+}
+
+/// Returns a `Rect` centered within `area`, sized to `percent_x`/`percent_y`
+/// of its width/height.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+/// Draws the per-row action menu (triggered by `Enter` on a selected run).
+fn draw_menu_overlay(frame: &mut Frame, app: &App, area: Rect, selected: usize) {
+    let run_failed = app.selected_run_failed();
+
+    let items: Vec<ListItem> = MENU_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let disabled = i == 1 && !run_failed;
+            let style = if disabled {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            let text = if disabled {
+                format!("{label} (no failed jobs)")
+            } else {
+                label.to_string()
+            };
+            ListItem::new(Span::styled(text, style))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Actions"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+
+    let rect = centered_rect(40, 30, area);
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected));
+
+    frame.render_widget(Clear, rect);
+    frame.render_stateful_widget(list, rect, &mut state);
+}
+
+/// Draws the confirmation prompt before rerunning failed jobs.
+fn draw_confirm_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let message = match app.selected_run() {
+        Some(run) => format!(
+            "Rerun failed jobs for {} #{}?\n\n(y) confirm   (n) cancel",
+            run.workflow_name, run.run_number
+        ),
+        None => "No run selected.\n\n(n) cancel".to_string(),
+    };
+
+    let block = Block::default().borders(Borders::ALL).title("Confirm rerun");
+    let paragraph = Paragraph::new(message).block(block);
+
+    let rect = centered_rect(50, 30, area);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(paragraph, rect);
 }
 
 /// Maps a run's status/conclusion to a display label and color.

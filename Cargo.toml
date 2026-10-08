@@ -13,6 +13,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 futures = "0.3.34"
+http = "1"
 octocrab = "0.54"
 open = "5"
 ratatui = "0.30"

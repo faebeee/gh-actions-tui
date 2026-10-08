@@ -19,6 +19,9 @@ pub enum Event {
     Tick,
     /// Background fetch results arrived.
     FetchComplete(Vec<RepoFetchResult>),
+    /// A rerun-failed-jobs API call completed, with `Err` holding a
+    /// human-readable message.
+    RerunComplete(Result<(), String>),
     /// The terminal was resized.
     Resize,
 }
@@ -88,6 +91,19 @@ impl EventBridge {
         tokio::spawn(async move {
             while let Some(results) = fetch_rx.recv().await {
                 if tx.send(Event::FetchComplete(results)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Bridges an async tokio channel (used by the rerun task to report
+    /// completion) into the sync channel consumed by the main loop.
+    pub fn spawn_rerun_bridge(&self, mut rerun_rx: tokio_mpsc::UnboundedReceiver<Result<(), String>>) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(result) = rerun_rx.recv().await {
+                if tx.send(Event::RerunComplete(result)).is_err() {
                     return;
                 }
             }

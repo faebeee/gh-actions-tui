@@ -901,6 +901,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "http",
  "octocrab",
  "open",
  "ratatui",

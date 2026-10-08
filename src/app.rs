@@ -69,6 +69,25 @@ impl StatusFilter {
     }
 }
 
+/// The two actions available in the per-row action menu.
+pub const MENU_ITEM_COUNT: usize = 2;
+
+/// Labels for the per-row action menu, in index order.
+pub const MENU_LABELS: [&str; MENU_ITEM_COUNT] = ["Open in browser", "Rerun failed jobs"];
+
+/// An overlay shown on top of the table: either the per-row action menu, or
+/// a confirmation prompt before rerunning failed jobs. Mutually exclusive
+/// with normal table navigation while active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overlay {
+    #[default]
+    None,
+    Menu {
+        selected: usize,
+    },
+    ConfirmRerun,
+}
+
 /// Overall application state, updated by the event loop and rendered by the
 /// UI layer.
 ///
@@ -92,6 +111,7 @@ pub struct App {
     pub refreshing: bool,
     pub status_message: Option<String>,
     pub should_quit: bool,
+    pub overlay: Overlay,
 }
 
 impl App {
@@ -107,6 +127,7 @@ impl App {
             refreshing: false,
             status_message: Some("Loading...".to_string()),
             should_quit: false,
+            overlay: Overlay::None,
         }
     }
 
@@ -194,6 +215,132 @@ impl App {
         self.status_message = Some(message.into());
     }
 
+    /// The currently selected row, if any, as a `RunInfo` (i.e. not an
+    /// error row). Public so the UI layer can render overlay text (e.g.
+    /// the rerun confirmation prompt).
+    pub fn selected_run(&self) -> Option<&RunInfo> {
+        let i = self.table_state.selected()?;
+        let &row_idx = self.visible.get(i)?;
+        match self.rows.get(row_idx) {
+            Some(Row::Run(run)) => Some(run),
+            _ => None,
+        }
+    }
+
+    /// Opens the currently selected row's run URL in the system's default
+    /// browser, if the selected row is a valid run (not an error row).
+    pub fn open_selected(&mut self) {
+        let Some(run) = self.selected_run() else {
+            self.set_status("No run URL available for this row");
+            return;
+        };
+        match open::that(&run.html_url) {
+            Ok(()) => self.set_status(format!("Opened {}", run.html_url)),
+            Err(e) => self.set_status(format!("Failed to open browser: {e}")),
+        }
+    }
+
+    /// Whether the currently selected run's outcome is a failure (i.e. it
+    /// has failed jobs eligible for a rerun). Public so the UI layer can
+    /// dim/disable the "Rerun failed jobs" menu item accordingly.
+    pub fn selected_run_failed(&self) -> bool {
+        self.selected_run()
+            .map(|run| {
+                RunOutcome::classify(&run.status, run.conclusion.as_deref()) == RunOutcome::Failure
+            })
+            .unwrap_or(false)
+    }
+
+    /// Opens the per-row action menu for the selected row. No-op if the
+    /// selected row isn't a valid run (e.g. an error row, or nothing
+    /// selected).
+    pub fn open_menu(&mut self) {
+        if self.selected_run().is_none() {
+            return;
+        }
+        self.overlay = Overlay::Menu { selected: 0 };
+    }
+
+    /// Closes any active overlay (menu or confirm prompt) without taking
+    /// action.
+    pub fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    /// Moves the menu selection to the next item, wrapping around.
+    pub fn menu_select_next(&mut self) {
+        if let Overlay::Menu { selected } = &mut self.overlay {
+            *selected = (*selected + 1) % MENU_ITEM_COUNT;
+        }
+    }
+
+    /// Moves the menu selection to the previous item, wrapping around.
+    pub fn menu_select_prev(&mut self) {
+        if let Overlay::Menu { selected } = &mut self.overlay {
+            *selected = (*selected + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
+        }
+    }
+
+    /// Activates the currently selected menu item.
+    pub fn menu_activate(&mut self) {
+        let Overlay::Menu { selected } = self.overlay else {
+            return;
+        };
+        match selected {
+            0 => {
+                self.overlay = Overlay::None;
+                self.open_selected();
+            }
+            1 => self.request_rerun_direct(),
+            _ => unreachable!("menu selection out of range"),
+        }
+    }
+
+    /// Requests a rerun of failed jobs for the selected row, bypassing the
+    /// menu (used by the direct `R` shortcut, and by the menu's "Rerun
+    /// failed jobs" item). Only proceeds to the confirmation prompt if the
+    /// selected run actually has a failed outcome.
+    pub fn request_rerun_direct(&mut self) {
+        if self.selected_run().is_none() {
+            self.overlay = Overlay::None;
+            self.set_status("No run selected");
+            return;
+        }
+        if !self.selected_run_failed() {
+            self.overlay = Overlay::None;
+            self.set_status("No failed jobs to rerun");
+            return;
+        }
+        self.overlay = Overlay::ConfirmRerun;
+    }
+
+    /// Confirms the pending rerun, returning the `(owner, repo, run_id)`
+    /// needed to make the API call, and closing the overlay. Returns
+    /// `None` if there's no confirm prompt active or the selected run is
+    /// no longer valid.
+    pub fn confirm_rerun(&mut self) -> Option<(String, String, u64)> {
+        if self.overlay != Overlay::ConfirmRerun {
+            return None;
+        }
+        self.overlay = Overlay::None;
+        let run = self.selected_run()?;
+        Some((run.owner.clone(), run.repo.clone(), run.id))
+    }
+
+    /// Cancels the pending rerun confirmation without taking action.
+    pub fn cancel_overlay(&mut self) {
+        self.close_overlay();
+    }
+
+    /// Applies the result of a rerun-failed-jobs API call, updating the
+    /// status message.
+    pub fn apply_rerun_result(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.set_status("Rerun of failed jobs triggered"),
+            Err(e) => self.set_status(format!("Failed to trigger rerun: {e}")),
+        }
+    }
+
     pub fn quit(&mut self) {
         self.should_quit = true;
     }
@@ -233,25 +380,6 @@ impl App {
             }
         }
     }
-
-    /// Opens the currently selected row's run URL in the system's default
-    /// browser, if the selected row is a valid run (not an error row).
-    pub fn open_selected(&mut self) {
-        let Some(i) = self.table_state.selected() else {
-            return;
-        };
-        let Some(&row_idx) = self.visible.get(i) else {
-            return;
-        };
-        let Some(Row::Run(run)) = self.rows.get(row_idx) else {
-            self.set_status("No run URL available for this row");
-            return;
-        };
-        match open::that(&run.html_url) {
-            Ok(()) => self.set_status(format!("Opened {}", run.html_url)),
-            Err(e) => self.set_status(format!("Failed to open browser: {e}")),
-        }
-    }
 }
 
 impl Row {
@@ -274,6 +402,7 @@ mod tests {
     /// varying between cases.
     fn run(status: &str, conclusion: Option<&str>) -> RunInfo {
         RunInfo {
+            id: 1,
             owner: "owner".to_string(),
             repo: "repo".to_string(),
             workflow_name: "CI".to_string(),
@@ -392,5 +521,102 @@ mod tests {
         app.cycle_filter_next(); // -> Failure: nothing matches, no errors either
         assert_eq!(app.visible_len(), 0);
         assert_eq!(app.table_state.selected(), None);
+    }
+
+    #[test]
+    fn open_menu_is_noop_on_error_row() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Err {
+            repo: repo_spec(),
+            message: "boom".to_string(),
+        }]);
+        app.table_state.select(Some(0));
+
+        app.open_menu();
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn menu_navigation_wraps_between_two_items() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("success"),
+        )])]);
+        app.table_state.select(Some(0));
+
+        app.open_menu();
+        assert_eq!(app.overlay, Overlay::Menu { selected: 0 });
+
+        app.menu_select_next();
+        assert_eq!(app.overlay, Overlay::Menu { selected: 1 });
+
+        app.menu_select_next();
+        assert_eq!(app.overlay, Overlay::Menu { selected: 0 });
+
+        app.menu_select_prev();
+        assert_eq!(app.overlay, Overlay::Menu { selected: 1 });
+    }
+
+    #[test]
+    fn rerun_is_blocked_when_run_has_not_failed() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("success"),
+        )])]);
+        app.table_state.select(Some(0));
+
+        app.request_rerun_direct();
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No failed jobs to rerun")
+        );
+    }
+
+    #[test]
+    fn rerun_direct_opens_confirm_prompt_when_run_failed() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+
+        app.request_rerun_direct();
+        assert_eq!(app.overlay, Overlay::ConfirmRerun);
+    }
+
+    #[test]
+    fn confirm_rerun_returns_run_identity_and_closes_overlay() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.request_rerun_direct();
+
+        let result = app.confirm_rerun();
+        assert_eq!(
+            result,
+            Some(("owner".to_string(), "repo".to_string(), 1))
+        );
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn cancel_overlay_closes_confirm_prompt_without_result() {
+        let mut app = App::new(vec![], 10);
+        app.apply_results(vec![RepoFetchResult::Ok(vec![run(
+            "completed",
+            Some("failure"),
+        )])]);
+        app.table_state.select(Some(0));
+        app.request_rerun_direct();
+
+        app.cancel_overlay();
+        assert_eq!(app.overlay, Overlay::None);
     }
 }

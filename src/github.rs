@@ -3,11 +3,13 @@
 use crate::cli::RepoSpec;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use http::Uri;
 use octocrab::Octocrab;
 
 /// A simplified, UI-friendly view of a single workflow run.
 #[derive(Debug, Clone)]
 pub struct RunInfo {
+    pub id: u64,
     pub owner: String,
     pub repo: String,
     pub workflow_name: String,
@@ -59,6 +61,26 @@ impl GitHubClient {
         futures::future::join_all(futures).await
     }
 
+    /// Triggers a re-run of only the failed jobs in a workflow run.
+    ///
+    /// Uses a raw POST since octocrab has no built-in helper for this
+    /// endpoint (only `cancel_workflow_run` is wrapped).
+    pub async fn rerun_failed_jobs(&self, owner: &str, repo: &str, run_id: u64) -> Result<()> {
+        let route = format!("/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
+        let uri: Uri = route
+            .parse()
+            .context("failed to build rerun-failed-jobs URI")?;
+        octocrab::map_github_error(
+            self.octocrab
+                ._post(uri, None::<&()>)
+                .await
+                .context("failed to send rerun-failed-jobs request")?,
+        )
+        .await
+        .map(|_: http::Response<_>| ())
+        .context("GitHub rejected the rerun-failed-jobs request")
+    }
+
     async fn fetch_one(&self, repo: RepoSpec, limit: u8) -> RepoFetchResult {
         let per_page = limit.min(100);
         let result = self
@@ -77,6 +99,7 @@ impl GitHubClient {
                     .into_iter()
                     .take(limit as usize)
                     .map(|run| RunInfo {
+                        id: run.id.into_inner(),
                         owner: repo.owner.clone(),
                         repo: repo.repo.clone(),
                         workflow_name: run.name,
