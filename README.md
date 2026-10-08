@@ -33,6 +33,13 @@ cargo build --release
 
 The binary is produced at `target/release/gh-actions-tui`.
 
+Alternatively, run the install script to build a release binary and symlink
+it into `~/.local/bin` (make sure that directory is on your `PATH`):
+
+```sh
+./install.sh
+```
+
 ## Usage
 
 ```sh
