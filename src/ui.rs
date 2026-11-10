@@ -9,9 +9,9 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, R
 use ratatui::Frame;
 
 /// Number of columns in the runs table (REPO, WORKFLOW, BRANCH, EVENT,
-/// STATUS, UPDATED, #). Used to pad partial rows (e.g. error rows) to the
+/// STATUS, UPDATED, #, RUN ID). Used to pad partial rows (e.g. error rows) to the
 /// full width.
-const COLUMN_COUNT: usize = 7;
+const COLUMN_COUNT: usize = 8;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     match &app.screen {
@@ -77,6 +77,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         Cell::from("STATUS"),
         Cell::from("UPDATED"),
         Cell::from("#"),
+        Cell::from("RUN ID"),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -94,6 +95,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(Span::styled(label, style)),
                     Cell::from(format_relative(run.updated_at)),
                     Cell::from(format!("#{}", run.run_number)),
+                    Cell::from(run.id.to_string()),
                 ])
             }
             Row::Error { repo, message } => error_row(&repo.to_string(), message),
@@ -108,6 +110,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Percentage(12),
         Constraint::Percentage(12),
         Constraint::Percentage(6),
+        Constraint::Length(12),
     ];
 
     let table = Table::new(rows, widths)
